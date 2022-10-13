@@ -33,12 +33,6 @@ const trafficMirrorVNI = 0xBEEF
 const trafficMirrorDescription = "vpcshark"
 
 func main() {
-	var err error
-	os.Stderr, err = os.OpenFile("/Users/aidan/dev/ge/vpcshark/log.txt", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0777)
-	if err != nil {
-		panic(fmt.Sprintf("%+v", err))
-	}
-
 	j, _ := json.MarshalIndent(os.Args, "", "  ")
 	fmt.Fprintln(os.Stderr, string(j))
 
@@ -63,7 +57,7 @@ func main() {
 	pf.String("launch-template-id", "", "")
 
 	ctx := context.Background()
-	err = rootCmd.ExecuteContext(ctx)
+	err := rootCmd.ExecuteContext(ctx)
 	if err != nil {
 		panic(fmt.Sprintf("%+v", err))
 	}
