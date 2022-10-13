@@ -628,7 +628,7 @@ func installSocat(ctx context.Context, client *ssh.Client) error {
 	sess.Stderr = os.Stderr
 	err = sess.Run("sudo yum install -y socat")
 	if err != nil {
-		return fmt.Errorf("running yum: %s: %w", err)
+		return fmt.Errorf("running yum: %w", err)
 	}
 
 	return nil
