@@ -131,14 +131,21 @@ func getTag(tags []types.Tag, name string) string {
 }
 
 func runExtcapConfig(ctx context.Context, profile, region, vpc, reloadOption string) error {
+	opts := []func(*config.LoadOptions) error{
+		config.WithSharedConfigProfile(profile),
+		config.WithRegion(region),
+	}
+
 	if reloadOption == "vpc" {
-		cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile))
+		cfg, err := config.LoadDefaultConfig(ctx, opts...)
 		if err != nil {
 			return fmt.Errorf(": %w", err)
 		}
 
 		api := ec2.NewFromConfig(cfg)
 		p := ec2.NewDescribeVpcsPaginator(api, &ec2.DescribeVpcsInput{})
+
+		lines := []string{}
 
 		for p.HasMorePages() {
 			page, err := p.NextPage(ctx)
@@ -153,21 +160,25 @@ func runExtcapConfig(ctx context.Context, profile, region, vpc, reloadOption str
 					display = fmt.Sprintf("%s (%s)", vpcId, name)
 				}
 
-				fmt.Printf("value {arg=3}{value=%s}{display=%s}\n", vpcId, display)
+				lines = append(lines, fmt.Sprintf("value {arg=3}{value=%s}{display=%s}\n", vpcId, display))
 			}
 		}
 
+		sort.Strings(lines)
+		fmt.Println(strings.Join(lines, ""))
 		return nil
 	}
 
 	if reloadOption == "launch-template-id" {
-		cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile))
+		cfg, err := config.LoadDefaultConfig(ctx, opts...)
 		if err != nil {
 			return fmt.Errorf(": %w", err)
 		}
 
 		api := ec2.NewFromConfig(cfg)
 		p := ec2.NewDescribeLaunchTemplatesPaginator(api, &ec2.DescribeLaunchTemplatesInput{})
+
+		lines := []string{}
 
 		for p.HasMorePages() {
 			page, err := p.NextPage(ctx)
@@ -178,15 +189,17 @@ func runExtcapConfig(ctx context.Context, profile, region, vpc, reloadOption str
 			for _, template := range page.LaunchTemplates {
 				id := *template.LaunchTemplateId
 				name := *template.LaunchTemplateName
-				fmt.Printf("value {arg=5}{value=%s}{display=%s (%s)}\n", id, id, name)
+				lines = append(lines, fmt.Sprintf("value {arg=5}{value=%s}{display=%s (%s)}\n", id, id, name))
 			}
 		}
 
+		sort.Strings(lines)
+		fmt.Println(strings.Join(lines, ""))
 		return nil
 	}
 
 	if reloadOption == "eni" {
-		cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile))
+		cfg, err := config.LoadDefaultConfig(ctx, opts...)
 		if err != nil {
 			return fmt.Errorf(": %w", err)
 		}
@@ -200,6 +213,8 @@ func runExtcapConfig(ctx context.Context, profile, region, vpc, reloadOption str
 				},
 			},
 		})
+
+		lines := []string{}
 
 		for p.HasMorePages() {
 			page, err := p.NextPage(ctx)
@@ -216,12 +231,14 @@ func runExtcapConfig(ctx context.Context, profile, region, vpc, reloadOption str
 							display = fmt.Sprintf("%s (%s)", display, name)
 						}
 
-						fmt.Printf("value {arg=4}{value=%s}{display=%s}\n", eniId, display)
+						lines = append(lines, fmt.Sprintf("value {arg=4}{value=%s}{display=%s}\n", eniId, display))
 					}
 				}
 			}
 		}
 
+		sort.Strings(lines)
+		fmt.Println(strings.Join(lines, ""))
 		return nil
 	}
 
