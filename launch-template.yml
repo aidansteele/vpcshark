@@ -1,0 +1,100 @@
+Parameters:
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-5.10-hvm-arm64-gp2
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SshIpAddress:
+    Type: String
+
+Resources:
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: vpcshark-public
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        ImageId: !Ref ImageId
+        InstanceType: t4g.nano
+        InstanceInitiatedShutdownBehavior: terminate
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            SubnetId: !Ref SubnetId
+            Groups: [ !Ref SecurityGroup ]
+            AssociatePublicIpAddress: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: vpcshark
+              - Key: vpcshark
+                Value: ""
+          - ResourceType: network-interface
+            Tags:
+              - Key: Name
+                Value: vpcshark
+              - Key: vpcshark
+                Value: ""
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: ec2.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: AllowTrafficMirrorControl
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:DeleteTrafficMirror*
+                Resource: "*"
+                Condition:
+                  "Null":
+                    aws:ResourceTag/vpcshark: false
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub arn:aws:ec2:*:${AWS::AccountId}:traffic-mirror-*/*
+      Tags:
+        - Key: Name
+          Value: vpcshark
+        - Key: vpcshark
+          Value: ""
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [ !Ref InstanceRole ]
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and VXLAN
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - CidrIp: !Sub "${SshIpAddress}/32"
+          FromPort: 22
+          ToPort: 22
+          IpProtocol: tcp
+        - CidrIp: "0.0.0.0/0"
+          FromPort: 4789
+          ToPort: 4789
+          IpProtocol: udp
+      Tags:
+        - Key: Name
+          Value: vpcshark
+        - Key: vpcshark
+          Value: ""
+
+Outputs:
+  LaunchTemplate:
+    Value: !Ref LaunchTemplate
