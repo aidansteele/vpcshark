@@ -514,6 +514,18 @@ func (v *vpcshark) sshClient(ctx context.Context, connectivity string, sshcfg *s
 func (v *vpcshark) ctxmain(ctx context.Context, launchTemplateId, connectivity, eni string) error {
 	v.gui.StatusBar("starting")
 
+	describeSourceInstance, err := v.ec2.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		Filters: []types.Filter{
+			{
+				Name:   aws.String("network-interface.network-interface-id"),
+				Values: []string{eni},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("describing mirror source instance: %w", err)
+	}
+
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return fmt.Errorf("generating ssh keypair: %w", err)
@@ -574,7 +586,7 @@ func (v *vpcshark) ctxmain(ctx context.Context, launchTemplateId, connectivity, 
 
 	g.Go(func() error {
 		defer v.gui.Pcap().Close()
-		return writePcapToFifo(pr, v.gui.Pcap())
+		return writePcapToFifo(eni, *describeSourceInstance.Reservations[0].Instances[0].InstanceId, pr, v.gui.Pcap())
 	})
 
 	g.Go(func() error {
@@ -704,8 +716,28 @@ func runSocat(client *ssh.Client, pw io.Writer) error {
 	return nil
 }
 
-func writePcapToFifo(pr io.Reader, fifo io.WriteCloser) error {
-	w, err := pcapgo.NewNgWriter(fifo, layers.LinkTypeEthernet)
+func writePcapToFifo(eni, instanceId string, pr io.Reader, fifo io.WriteCloser) error {
+	//w, err := pcapgo.NewNgWriter(fifo, layers.LinkTypeEthernet)
+	w, err := pcapgo.NewNgWriterInterface(fifo, pcapgo.NgInterface{
+		Name:        eni,
+		Description: instanceId,
+		LinkType:    layers.LinkTypeEthernet,
+
+		//Comment:     "my-if-comment",
+		//Filter:      "my-if-filter",
+		//OS:          "my-if-os",
+		//TimestampResolution: 0,
+		//TimestampOffset:     0,
+		//SnapLength:          0,
+		Statistics: pcapgo.NgInterfaceStatistics{},
+	}, pcapgo.NgWriterOptions{
+		SectionInfo: pcapgo.NgSectionInfo{
+			//Hardware:    "my-hardware",
+			//OS:          "my-os",
+			//Application: "my-application",
+			//Comment:     "my-comment",
+		},
+	})
 	if err != nil {
 		return fmt.Errorf(": %w", err)
 	}
