@@ -1,13 +1,15 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	_ "embed"
 	"encoding/base64"
-	"encoding/hex"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/aidansteele/vpcshark/awsdial"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -17,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/aws/aws-sdk-go/aws/endpoints"
+	"github.com/bramvdbogaerde/go-scp"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
@@ -30,6 +33,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -37,6 +41,12 @@ const trafficMirrorVNI = 0xBEEF
 const trafficMirrorDescription = "vpcshark"
 
 func main() {
+	var err error
+	os.Stderr, err = os.OpenFile("/tmp/vpcshark.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0777)
+	if err != nil {
+		panic(fmt.Sprintf("%+v", err))
+	}
+
 	mrand.Seed(time.Now().UnixNano())
 	fmt.Fprintf(os.Stderr, "%x\n", mrand.Int63())
 
@@ -64,10 +74,12 @@ func main() {
 	pf.String("connectivity", "", "")
 
 	ctx := context.Background()
-	err := rootCmd.ExecuteContext(ctx)
+	err = rootCmd.ExecuteContext(ctx)
 	if err != nil {
 		panic(fmt.Sprintf("%+v", err))
 	}
+
+	fmt.Fprintln(os.Stderr, "Exited cleanly")
 }
 
 func runVpcshark(cmd *cobra.Command, args []string) error {
@@ -92,7 +104,7 @@ func runVpcshark(cmd *cobra.Command, args []string) error {
 	connectivity, _ := pf.GetString("connectivity")
 
 	if cleanup {
-		return runCleanup(ctx, profile)
+		return cleanupAll(ctx, profile, region)
 	} else if extcapInterfaces {
 		return runExtcapInterfaces(ctx)
 	} else if extcapConfig {
@@ -332,8 +344,8 @@ func runCapture(ctx context.Context, profile, region, launchTemplateId, connecti
 		ctx,
 		config.WithSharedConfigProfile(profile),
 		config.WithRegion(region),
-		//config.WithClientLogMode(aws.LogRequestWithBody|aws.LogResponseWithBody),
-		config.WithClientLogMode(aws.LogRequest|aws.LogResponse),
+		config.WithClientLogMode(aws.LogRequestWithBody|aws.LogResponseWithBody),
+		//config.WithClientLogMode(aws.LogRequest|aws.LogResponse),
 	)
 	if err != nil {
 		return fmt.Errorf(": %w", err)
@@ -538,6 +550,7 @@ func (v *vpcshark) ctxmain(ctx context.Context, launchTemplateId, connectivity, 
 
 	tags := []types.Tag{
 		{Key: aws.String("Name"), Value: aws.String("vpcshark")},
+		{Key: aws.String("vpcshark"), Value: aws.String("")},
 	}
 
 	instance, err := v.startInstance(ctx, sshpub, launchTemplateId)
@@ -545,11 +558,20 @@ func (v *vpcshark) ctxmain(ctx context.Context, launchTemplateId, connectivity, 
 		return fmt.Errorf(": %w", err)
 	}
 
+	defer func(ctx context.Context) {
+		instanceId := *instance.InstanceId
+		fmt.Fprintf(os.Stderr, "Terminating %s\n", instanceId)
+		_, err = v.ec2.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{instanceId}})
+		fmt.Fprintf(os.Stderr, "Error terminating %s: %+v\n", instanceId, err)
+	}(ctx)
+
 	captureEni := *instance.NetworkInterfaces[0].NetworkInterfaceId
-	err = v.createTrafficMirror(ctx, eni, captureEni, tags)
+	targetId, cleanup, err := v.createTrafficMirror(ctx, eni, captureEni, tags)
 	if err != nil {
 		return err
 	}
+
+	defer cleanup()
 
 	signer, err := ssh.NewSignerFromSigner(priv)
 	if err != nil {
@@ -572,32 +594,37 @@ func (v *vpcshark) ctxmain(ctx context.Context, launchTemplateId, connectivity, 
 	}
 	defer client.Close()
 
-	v.gui.StatusBar(fmt.Sprintf("Configuring socat on instance %s", *instance.InstanceId))
-
-	err = installSocat(ctx, client)
+	err = v.installRemoteTool(ctx, client)
 	if err != nil {
 		return fmt.Errorf("installing socat: %w", err)
 	}
 
 	v.gui.StatusBar("Good to go")
 
-	pr, pw := io.Pipe()
+	ctx, cancel := context.WithCancel(ctx)
 	g, ctx := errgroup.WithContext(ctx)
+	pktch := make(chan []byte)
 
 	g.Go(func() error {
-		defer v.gui.Pcap().Close()
-		return writePcapToFifo(eni, *describeSourceInstance.Reservations[0].Instances[0].InstanceId, pr, v.gui.Pcap())
+		defer cancel()
+		err := v.writePcapToFifo(ctx, eni, *describeSourceInstance.Reservations[0].Instances[0].InstanceId, pktch, v.gui.Pcap())
+		if errors.Is(err, syscall.EPIPE) {
+			fmt.Fprintln(os.Stderr, "Wireshark closed pcap fifo")
+			return nil
+		}
+
+		return err
 	})
 
 	g.Go(func() error {
-		return runSocat(client, pw)
+		return v.runRemoteTool(ctx, client, targetId, pktch)
 	})
 
 	err = g.Wait()
 	return err
 }
 
-func (v *vpcshark) createTrafficMirror(ctx context.Context, mirroredEni, captureEni string, tags []types.Tag) error {
+func (v *vpcshark) createTrafficMirror(ctx context.Context, mirroredEni, captureEni string, tags []types.Tag) (targetId string, cleanup func(), err error) {
 	target, err := v.ec2.CreateTrafficMirrorTarget(ctx, &ec2.CreateTrafficMirrorTargetInput{
 		NetworkInterfaceId: &captureEni,
 		Description:        aws.String(trafficMirrorDescription),
@@ -606,11 +633,11 @@ func (v *vpcshark) createTrafficMirror(ctx context.Context, mirroredEni, capture
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("creating traffic mirror target: %w", err)
+		return "", cleanup, fmt.Errorf("creating traffic mirror target: %w", err)
 	}
 
-	targetId := target.TrafficMirrorTarget.TrafficMirrorTargetId
-	v.gui.StatusBar(fmt.Sprintf("Created traffic mirror target %s", *targetId))
+	targetId = *target.TrafficMirrorTarget.TrafficMirrorTargetId
+	v.gui.StatusBar(fmt.Sprintf("Created traffic mirror target %s", targetId))
 
 	filter, err := v.ec2.CreateTrafficMirrorFilter(ctx, &ec2.CreateTrafficMirrorFilterInput{
 		Description: aws.String(trafficMirrorDescription),
@@ -619,7 +646,7 @@ func (v *vpcshark) createTrafficMirror(ctx context.Context, mirroredEni, capture
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("creating traffic mirror filter: %w", err)
+		return "", cleanup, fmt.Errorf("creating traffic mirror filter: %w", err)
 	}
 
 	filterId := filter.TrafficMirrorFilter.TrafficMirrorFilterId
@@ -630,7 +657,7 @@ func (v *vpcshark) createTrafficMirror(ctx context.Context, mirroredEni, capture
 		AddNetworkServices:    []types.TrafficMirrorNetworkService{types.TrafficMirrorNetworkServiceAmazonDns},
 	})
 	if err != nil {
-		return fmt.Errorf("enabling dns resolution in mirror filter: %w", err)
+		return "", cleanup, fmt.Errorf("enabling dns resolution in mirror filter: %w", err)
 	}
 
 	_, err = v.ec2.CreateTrafficMirrorFilterRule(ctx, &ec2.CreateTrafficMirrorFilterRuleInput{
@@ -642,7 +669,7 @@ func (v *vpcshark) createTrafficMirror(ctx context.Context, mirroredEni, capture
 		RuleNumber:            aws.Int32(100),
 	})
 	if err != nil {
-		return fmt.Errorf("creating filter ingress rule: %w", err)
+		return "", cleanup, fmt.Errorf("creating filter ingress rule: %w", err)
 	}
 
 	_, err = v.ec2.CreateTrafficMirrorFilterRule(ctx, &ec2.CreateTrafficMirrorFilterRuleInput{
@@ -654,14 +681,14 @@ func (v *vpcshark) createTrafficMirror(ctx context.Context, mirroredEni, capture
 		RuleNumber:            aws.Int32(100),
 	})
 	if err != nil {
-		return fmt.Errorf("creating filter egress rule: %w", err)
+		return "", cleanup, fmt.Errorf("creating filter egress rule: %w", err)
 	}
 
 	session, err := v.ec2.CreateTrafficMirrorSession(ctx, &ec2.CreateTrafficMirrorSessionInput{
 		NetworkInterfaceId:    &mirroredEni,
 		SessionNumber:         aws.Int32(int32(1_000 + mrand.Intn(30_000))),
 		TrafficMirrorFilterId: filterId,
-		TrafficMirrorTargetId: targetId,
+		TrafficMirrorTargetId: &targetId,
 		VirtualNetworkId:      aws.Int32(trafficMirrorVNI),
 		Description:           aws.String(trafficMirrorDescription),
 		TagSpecifications: []types.TagSpecification{
@@ -669,128 +696,141 @@ func (v *vpcshark) createTrafficMirror(ctx context.Context, mirroredEni, capture
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("creating traffic mirror session: %w", err)
+		return "", cleanup, fmt.Errorf("creating traffic mirror session: %w", err)
 	}
 
 	sessionId := session.TrafficMirrorSession.TrafficMirrorSessionId
 	v.gui.StatusBar(fmt.Sprintf("Created traffic mirror session %s", *sessionId))
 
-	return nil
+	cleanup = func() {
+		fmt.Fprintf(os.Stderr, "Deleting %s\n", *sessionId)
+		v.ec2.DeleteTrafficMirrorSession(ctx, &ec2.DeleteTrafficMirrorSessionInput{TrafficMirrorSessionId: sessionId})
+
+		fmt.Fprintf(os.Stderr, "Deleting %s\n", *filterId)
+		v.ec2.DeleteTrafficMirrorFilter(ctx, &ec2.DeleteTrafficMirrorFilterInput{TrafficMirrorFilterId: filterId})
+
+		fmt.Fprintf(os.Stderr, "Deleting %s\n", targetId)
+		v.ec2.DeleteTrafficMirrorTarget(ctx, &ec2.DeleteTrafficMirrorTargetInput{TrafficMirrorTargetId: &targetId})
+	}
+
+	return targetId, cleanup, nil
 }
 
-func runSocat(client *ssh.Client, pw io.Writer) error {
-	setup, err := client.NewSession()
-	if err != nil {
-		return fmt.Errorf(": %w", err)
-	}
-	defer setup.Close()
-
-	setup.Stdin = strings.NewReader(`#!/bin/sh
-		trap "sudo shutdown -h now" EXIT
-		socat -u udp4-recvfrom:4789,fork exec:"/usr/bin/xxd -p -c0"
-	`)
-	err = setup.Run("cat - > script.sh")
-	if err != nil {
-		return fmt.Errorf("copying script to instance: %w", err)
-	}
-
+func (v *vpcshark) runRemoteTool(ctx context.Context, client *ssh.Client, targetId string, packets chan []byte) error {
 	sess, err := client.NewSession()
 	if err != nil {
-		return fmt.Errorf("opening ssh session for socat: %w", err)
+		return fmt.Errorf("opening ssh session for remote tool: %w", err)
 	}
 	defer sess.Close()
 
-	sess.Stdout = pw
+	go func() {
+		<-ctx.Done()
+		sess.Close()
+	}()
+
+	sess.Stdout = os.Stderr
 	sess.Stderr = os.Stderr
-	// requesting a pty ensures that socat doesn't ignore us disconnecting
-	err = sess.RequestPty("xterm", 80, 40, ssh.TerminalModes{})
+
+	err = sess.Run(fmt.Sprintf("%s %s %s", remotePath, v.region, targetId))
 	if err != nil {
-		return fmt.Errorf("requesting pty: %w", err)
+		return fmt.Errorf("running remote cmd: %w", err)
 	}
 
-	err = sess.Run("sh script.sh")
-	if err != nil {
-		return fmt.Errorf("starting socat: %w", err)
-	}
+	time.Sleep(time.Second)
 
-	return nil
+	conn, err := client.Dial("tcp", "127.0.0.1:4790")
+	if err != nil {
+		return fmt.Errorf("dialing 4790: %w", err)
+	}
+	defer conn.Close()
+
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+
+	lenbuf := make([]byte, 2)
+	for {
+		_, err := conn.Read(lenbuf)
+		if err != nil {
+			return fmt.Errorf("reading conn: %w", err)
+		}
+
+		pktlen := binary.BigEndian.Uint16(lenbuf)
+		pkt := make([]byte, pktlen)
+		_, err = io.ReadFull(conn, pkt)
+		if err != nil {
+			return fmt.Errorf(": %w", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case packets <- pkt:
+			// no-op
+		}
+	}
 }
 
-func writePcapToFifo(eni, instanceId string, pr io.Reader, fifo io.WriteCloser) error {
-	//w, err := pcapgo.NewNgWriter(fifo, layers.LinkTypeEthernet)
+func (v *vpcshark) writePcapToFifo(ctx context.Context, eni, instanceId string, packets chan []byte, fifo io.WriteCloser) error {
 	w, err := pcapgo.NewNgWriterInterface(fifo, pcapgo.NgInterface{
 		Name:        eni,
 		Description: instanceId,
 		LinkType:    layers.LinkTypeEthernet,
-
-		//Comment:     "my-if-comment",
-		//Filter:      "my-if-filter",
-		//OS:          "my-if-os",
-		//TimestampResolution: 0,
-		//TimestampOffset:     0,
-		//SnapLength:          0,
-		Statistics: pcapgo.NgInterfaceStatistics{},
-	}, pcapgo.NgWriterOptions{
-		SectionInfo: pcapgo.NgSectionInfo{
-			//Hardware:    "my-hardware",
-			//OS:          "my-os",
-			//Application: "my-application",
-			//Comment:     "my-comment",
-		},
-	})
+		Statistics:  pcapgo.NgInterfaceStatistics{},
+	}, pcapgo.NgWriterOptions{})
 	if err != nil {
 		return fmt.Errorf(": %w", err)
 	}
 
-	scan := bufio.NewScanner(pr)
-	for scan.Scan() {
-		raw, err := hex.DecodeString(scan.Text())
-		if err != nil {
-			return fmt.Errorf("decoding base64: %w", err)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case pktbuf := <-packets:
+			pkt := gopacket.NewPacket(pktbuf, layers.LayerTypeVXLAN, gopacket.Default)
+			vxlan := pkt.Layers()[0].(*layers.VXLAN)
+			payload := vxlan.LayerPayload()
+
+			err = w.WritePacket(gopacket.CaptureInfo{
+				Timestamp:     time.Now(),
+				CaptureLength: len(payload),
+				Length:        len(payload),
+				//InterfaceIndex: 0,
+				//AncillaryData:  nil,
+			}, payload)
+			if err != nil {
+				return fmt.Errorf("write : %w", err)
+			}
+
+			err = w.Flush()
+			if err != nil {
+				return fmt.Errorf("flush : %w", err)
+			}
+
+			if err != nil {
+				return fmt.Errorf("sync : %w", err)
+			}
 		}
-
-		pkt := gopacket.NewPacket(raw, layers.LayerTypeVXLAN, gopacket.Default)
-		vxlan := pkt.Layers()[0].(*layers.VXLAN)
-		payload := vxlan.LayerPayload()
-
-		err = w.WritePacket(gopacket.CaptureInfo{
-			Timestamp:     time.Now(),
-			CaptureLength: len(payload),
-			Length:        len(payload),
-			//InterfaceIndex: 0,
-			//AncillaryData:  nil,
-		}, payload)
-		if err != nil {
-			return fmt.Errorf("write : %w", err)
-		}
-
-		err = w.Flush()
-		if err != nil {
-			return fmt.Errorf("flush : %w", err)
-		}
-
-		if err != nil {
-			return fmt.Errorf("sync : %w", err)
-		}
-
-		fmt.Printf("%d\n", len(raw))
 	}
-
-	return nil
 }
 
-func installSocat(ctx context.Context, client *ssh.Client) error {
-	sess, err := client.NewSession()
-	if err != nil {
-		return fmt.Errorf("opening ssh session: %w", err)
-	}
-	defer sess.Close()
+//go:embed remote/remote
+var remoteBinary []byte
 
-	sess.Stdout = os.Stdout
-	sess.Stderr = os.Stderr
-	err = sess.Run("sudo yum install -y socat")
+const remotePath = "/tmp/vpcshark-remote"
+
+func (v *vpcshark) installRemoteTool(ctx context.Context, client *ssh.Client) error {
+	v.gui.StatusBar("Copying remote helper to instance")
+
+	c, err := scp.NewClientBySSH(client)
 	if err != nil {
-		return fmt.Errorf("running yum: %w", err)
+		return fmt.Errorf("creating scp client: %w", err)
+	}
+
+	err = c.Copy(ctx, bytes.NewReader(remoteBinary), remotePath, "0755", int64(len(remoteBinary)))
+	if err != nil {
+		return fmt.Errorf("copying remote binary over scp: %w", err)
 	}
 
 	return nil

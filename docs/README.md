@@ -17,6 +17,17 @@ resources.
 
 ## Usage
 
+First you need to build the remote tool that is copied to and executed on the
+remote EC2 instance. You can do that like this:
+
+    (cd remote; GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w"; upx remote)
+
+The `upx` step is optional, but makes copying the file faster. After that, you 
+can `go build` the vpcshark executable like normal. These steps are needed
+because the `remote` binary is actually copied into the `vpcshark` binary.
+
+Logs will appear in `/tmp/vpcshark.log`.
+
 You need to copy (or symlink) `vpcshark` into the `extcap` directory. By default
 that is `/Applications/Wireshark.app/Contents/MacOS/extcap/` on macOS. When you
 launch Wireshark, you will see a new capture interface named _AWS VPC Traffic Mirroring: awsvpc_.

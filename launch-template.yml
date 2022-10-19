@@ -56,6 +56,9 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
+                Action: ec2:DescribeTrafficMirror*
+                Resource: "*"
+              - Effect: Allow
                 Action: ec2:DeleteTrafficMirror*
                 Resource: "*"
                 Condition:
