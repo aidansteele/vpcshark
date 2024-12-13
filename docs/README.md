@@ -1,3 +1,16 @@
+## 2024 Update
+
+All the code in this repo was written in mid 2022 when VPC traffic mirroring was 
+relatively new and shiny. I had kept this code closed-source because I had unrealistic
+ambitions about perhaps making this project open-core with a value-add SaaS on the
+side. In the interim, it seems that AWS has launched sixth, seventh and eighth-generation
+EC2 instance family types [without][docs] traffic mirroring support. I have no inside
+knowledge, but that indicates to me that the functionality will only become less useful
+as the fifth-generation EC2 instances become increasingly obsolete. So here's an open
+source dump of code for historical interest.
+
+[docs]: https://docs.aws.amazon.com/vpc/latest/mirroring/traffic-mirroring-network-limitations.html
+
 # vpcshark
 
 `vpcshark` is an `extcap` Wireshark plugin that automates VPC traffic mirroring.
